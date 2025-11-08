@@ -1,10 +1,5 @@
-#!/usr/bin/env python3
-"""
-Isaac model registration with vLLM MULTIMODAL_REGISTRY.
-Complete integration including processor, model interface, and weight loading skeleton.
-"""
-
 from __future__ import annotations
+
 from collections.abc import Mapping, Sequence, Iterable
 from typing import Any, Optional, Union
 from typing_extensions import TypedDict, Unpack
@@ -12,7 +7,6 @@ from typing_extensions import TypedDict, Unpack
 import itertools
 from enum import Enum
 from dataclasses import dataclass
-from typing import List, Iterator
 
 import math
 import numpy as np
@@ -31,25 +25,26 @@ from transformers.models.siglip2.configuration_siglip2 import Siglip2VisionConfi
 
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.model_executor.models.interfaces import SupportsMultiModal
-from vllm.model_executor.models.utils import WeightsMapper, AutoWeightsLoader
+from vllm.model_executor.models.utils import (
+    WeightsMapper,
+    AutoWeightsLoader,
+    _merge_multimodal_embeddings,
+)
 from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
 from vllm.model_executor.models.module_mapping import MultiModelKeys
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-
 from vllm.multimodal.processing import (
     BaseMultiModalProcessor,
     BaseProcessingInfo,
+    PromptReplacement,
 )
-
 from vllm.multimodal.parse import MultiModalDataItems, ImageSize
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
-
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargs,
     MultiModalDataDict,
 )
-
+from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsLoRA,
@@ -230,6 +225,7 @@ class TensorStream:
         )
         return (len(seq_lens), seq_lens[0])
 
+
 def compute_mrope_pos_tensor(ts: TensorStream, n_pos_dims: int = 3) -> torch.Tensor:
     """
     Create a (batch, T, n_pos_dims) position tensor in one sweep.
@@ -396,6 +392,7 @@ class Siglip2VariableSequenceEmbeddings(nn.Module):
         # Add positional embeddings to patch embeddings
         embeddings = patch_embeds + pos_embeds
         return embeddings
+
 
 class Siglip2VariableLengthAttention(nn.Module):
     """Custom attention that supports variable-length sequences with flash attention."""
@@ -1064,7 +1061,6 @@ class IsaacImageProcessor:
             # This ensures the vision model receives correct grid info for pixel shuffle
             dims_real = [1, hp, wp]  # Real patch dimensions
             image_grid_thw = torch.tensor(dims_real).unsqueeze(0)  # [1, [T, H, W]]
-            print(f"DEBUG IMAGE PROCESSOR: image_grid_thw = {image_grid_thw}")
 
             all_pixel_values.append(pixel_values)
             all_image_grids.append(image_grid_thw)
@@ -1179,7 +1175,7 @@ class IsaacProcessingInfo(BaseProcessingInfo):
         return self.get_hf_processor(**kwargs).image_processor
 
     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
-        return {"image": None}  # None means unlimited images are supported, like Qwen2-VL
+        return {"image": None}
 
     def get_mm_max_tokens_per_item(
         self, seq_len: int, mm_counts: Mapping[str, int],
@@ -1188,82 +1184,6 @@ class IsaacProcessingInfo(BaseProcessingInfo):
         num_vision_tokens = hf_config.vision_max_num_patches // (hf_config.pixel_shuffle_scale**2)
         return {"image": num_vision_tokens}
 
-
-class IsaacMultiModalProcessor(BaseMultiModalProcessor):
-    """
-    Minimal processor implementing the current vLLM contract:
-      - _get_mm_fields_config (required abstract)
-      - _get_prompt_updates (required abstract)
-    """
-
-    def _get_mm_fields_config(self, hf_inputs: Mapping[str, Any], hf_processor_mm_kwargs: Mapping[str, Any]) -> dict[str, MultiModalFieldConfig]:
-        # Configure multimodal fields for Isaac model
-        image_grid_thw = hf_inputs.get("image_grid_thw", torch.empty((0, 3)))
-        print(f"DEBUG _get_mm_fields_config: image_grid_thw.shape = {image_grid_thw.shape}")
-        print(f"DEBUG _get_mm_fields_config: image_grid_thw = {image_grid_thw}")
-        
-        # For Isaac: image_grid_thw is [T, H, W] where T=1 for images
-        # Calculate number of patches per image as H * W (not T * H * W)
-        if image_grid_thw.numel() > 0:
-            image_grid_sizes = image_grid_thw[:, 1] * image_grid_thw[:, 2]  # H * W only
-        else:
-            image_grid_sizes = torch.empty((0,))
-        
-        return {
-            "pixel_values": MultiModalFieldConfig.flat_from_sizes("image", image_grid_sizes),
-            "image_grid_thw": MultiModalFieldConfig.batched("image"),
-        }
-
-    def _get_prompt_updates(
-        self,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, Any],
-        out_mm_kwargs: MultiModalKwargs,
-    ) -> Sequence[PromptUpdate]:
-        """Isaac prompt updates following Qwen2VL pattern but with Isaac parameters."""
-        from vllm.multimodal.processing import PromptReplacement
-        from functools import partial
-        
-        #hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
-        image_processor = self.info.get_image_processor(**hf_processor_mm_kwargs)
-        tokenizer = self.info.get_tokenizer()
-        
-        if tokenizer is None:
-            # Fallback - use known ID for <|image_pad|> token
-            placeholder_id = 151655  
-        else:
-            vocab = tokenizer.get_vocab()
-            placeholder_id = vocab.get("<|image_pad|>", 151655)  # Use actual vocab token
-        
-        # Isaac uses pixel_shuffle_scale instead of merge_size
-        pixel_shuffle_scale = getattr(image_processor, 'pixel_shuffle_scale', 2)
-        merge_length = pixel_shuffle_scale ** 2
-
-        def get_replacement_isaac(item_idx: int, modality: str):
-            if modality == "image":
-                out_item = out_mm_kwargs["image"][item_idx]
-                grid_thw = out_item["image_grid_thw"].data
-                assert isinstance(grid_thw, torch.Tensor)
-
-                num_tokens = int(grid_thw.prod()) // merge_length
-                return [placeholder_id] * num_tokens
-            #return []
-
-        def get_image_replacement_qwen3vl(item_idx: int):
-            out_item = out_mm_kwargs["image"][item_idx]
-            grid_thw = out_item["image_grid_thw"].data
-            assert isinstance(grid_thw, torch.Tensor)
-
-            num_tokens = int(grid_thw.prod()) // merge_length
-            return [hf_processor.image_token_id] * num_tokens
-
-        return [
-            PromptReplacement(
-                modality="image",
-                target=[placeholder_id],
-                replacement=partial(get_replacement_isaac, modality="image"),
-            )
-        ]
 
 class IsaacDummyInputsBuilder(BaseDummyInputsBuilder[IsaacProcessingInfo]): 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
@@ -1278,7 +1198,7 @@ class IsaacDummyInputsBuilder(BaseDummyInputsBuilder[IsaacProcessingInfo]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str] | None = None,#: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: Mapping[str] | None = None,
     ) -> MultiModalDataDict:
         num_images = mm_counts.get("image", 0)
 
@@ -1293,6 +1213,57 @@ class IsaacDummyInputsBuilder(BaseDummyInputsBuilder[IsaacProcessingInfo]):
                 overrides=image_overrides,
             ),
         }
+
+
+class IsaacMultiModalProcessor(BaseMultiModalProcessor):
+
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+            
+        # Configure multimodal fields for Isaac model
+        image_grid_thw = hf_inputs.get("image_grid_thw", torch.empty((0, 3)))
+        image_grid_sizes = image_grid_thw.prod(-1)
+
+        return {
+            "pixel_values": MultiModalFieldConfig.flat_from_sizes("image", image_grid_sizes),
+            "image_grid_thw": MultiModalFieldConfig.batched("image"),
+        }
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, Any],
+        out_mm_kwargs: MultiModalKwargs,
+    ) -> Sequence[PromptUpdate]:
+
+        #hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+        image_processor = self.info.get_image_processor(**hf_processor_mm_kwargs)
+        tokenizer = self.info.get_tokenizer()
+
+        vocab = tokenizer.get_vocab()
+        placeholder_id = vocab.get("<|image_pad|>", 151655)
+        
+        pixel_shuffle_scale = getattr(image_processor, 'pixel_shuffle_scale', 2)
+        merge_length = pixel_shuffle_scale ** 2
+            
+        def get_replacement_isaac(item_idx: int):
+            out_item = out_mm_kwargs["image"][item_idx]
+            grid_thw = out_item["image_grid_thw"].data
+            assert isinstance(grid_thw, torch.Tensor)
+
+            num_tokens = int(grid_thw.prod()) // merge_length
+            return [placeholder_id] * num_tokens            
+
+        return [
+            PromptReplacement(
+                modality="image",
+                target=[placeholder_id],
+                replacement=get_replacement_isaac,
+            )
+        ]
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1314,65 +1285,39 @@ class IsaacForConditionalGeneration(
     )
 
     @classmethod
-    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
-        """Get placeholder string for multimodal items."""
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
             return "<|image_pad|>"
+        
         raise ValueError("Only image modality is supported")
 
-    def __init__(self, *, vllm_config, prefix: str = ""):
-        """Initialize Isaac model with vLLM config."""
-        config = vllm_config.model_config.hf_config
-        print(f"🔧 Initializing Isaac model with config: {config}")
-        
-        # Add missing image_token_id for vLLM MRoPE compatibility
-        if not hasattr(config, 'image_token_id'):
-            # Get the token ID for <|image_pad|> from the tokenizer 
-            config.image_token_id = 151655  # This is the ID for <|image_pad|> in Qwen tokenizer
-            print(f"🔧 Isaac: Added image_token_id = {config.image_token_id}")
-        
-        # Override rope_scaling to inject calculated mrope_section values (Isaac's approach)
-        # This ensures vLLM's get_rope() creates MRotaryEmbedding with proper mrope_section
-        if hasattr(config, 'rope_scaling') and config.rope_scaling:
-            # Calculate mrope_section the same way original Isaac does
-            head_dim = getattr(config, 'head_dim', 128)
-            calculated_mrope_section = [
-                head_dim // 4,  # temporal dimension gets more capacity
-                head_dim // 8,  # height dimension  
-                head_dim // 8,  # width dimension
-            ]
-            
-            print(f"🔧 Isaac: Calculated mrope_section = {calculated_mrope_section} from head_dim = {head_dim}")
-            
-            # Inject calculated values into rope_scaling config
-            if isinstance(config.rope_scaling, dict):
-                config.rope_scaling = config.rope_scaling.copy()
-            else:
-                config.rope_scaling = {}
-            
-            config.rope_scaling["mrope_section"] = calculated_mrope_section
-            print(f"🔧 Isaac: Updated rope_scaling = {config.rope_scaling}")
-        
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
+
+        config: IsaacConfig = vllm_config.model_config.hf_config
+        head_dim = config.head_dim
+
+        calculated_mrope_section = [
+            head_dim // 4,  # 2x more for temporal dim
+            head_dim // 8,
+            head_dim // 8,
+        ]
+
+        config.rope_scaling["mrope_section"] = calculated_mrope_section
+        self.config = config
+
         # Initialize the parent class with updated config
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        
-        # Override the language model structure to match checkpoint
-        # The parent class creates self.model.layers, but we need direct access
-        # Create the language model layers directly to match checkpoint structure
+
+        # Create the language model module to match checkpoint structure
         self.language_model = nn.ModuleDict({
             "embed_tokens": self.model.embed_tokens,
             "layers": self.model.layers,
             "norm": self.model.norm
         })
-        
-        # Create vision embedding 
+
         vision_cfg = config.vision_config
         if vision_cfg is None:
             raise ValueError("IsaacConfig should always have vision_config")
-        
-        # Convert dict to PixelShuffleSiglip2VisionConfig if needed
-        if isinstance(vision_cfg, dict):
-            vision_cfg = PixelShuffleSiglip2VisionConfig(**vision_cfg)
 
         hidden_dim = vision_cfg.hidden_size * (vision_cfg.pixel_shuffle_scale_factor**2)
         self.vision_embedding = nn.Sequential(
@@ -1384,16 +1329,6 @@ class IsaacForConditionalGeneration(
             ),
             nn.SiLU(),
             nn.Linear(4 * hidden_dim, config.hidden_size, bias=False),
-        )
-
-        self.vocab_size = config.vocab_size
-        # Use vLLM's ParallelLMHead to ensure proper quantization support
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            bias=False,
-            quant_config=getattr(vllm_config, 'quant_config', None),
-            prefix=f"{prefix}lm_head" if prefix else "lm_head"
         )
 
     def get_mrope_input_positions(
@@ -1410,36 +1345,26 @@ class IsaacForConditionalGeneration(
     ) -> tuple[torch.Tensor, int]:
         """Get mrope input positions and delta value."""
 
-        image_token_id = hf_config.image_token_id
+        vision_token_id = getattr(self.config, 'image_token_id', 151655)
         spatial_merge_size = hf_config.vision_config.pixel_shuffle_scale_factor
-        
         input_tokens_tensor = torch.tensor(input_tokens)
         
         # Find image token positions
-        image_positions = torch.where(input_tokens_tensor == image_token_id)[0].tolist()
-        #print(f"len(image_positions) = {len(image_positions)}")
-        #print(f"image_positions = {image_positions}")
-
+        image_positions = torch.where(input_tokens_tensor == vision_token_id)[0].tolist()
+        
         # For text-only inputs, use Isaac's original logic from compute_position_ids_input_ids()
         if len(image_positions) == 0:
             seq_len = len(input_tokens)
             # Create 3D positions where all dimensions get the same 1D temporal progression
-            # This matches Isaac's compute_position_ids_input_ids() exactly
             position_ids = torch.arange(seq_len, dtype=torch.long)
             position_ids = position_ids.view(1, -1).expand(1, -1)  # [1, seq_len]
             position_ids = position_ids.unsqueeze(2).expand(-1, -1, 3)  # [1, seq_len, 3]
-            
+
             # vLLM expects shape [3, seq_len], so transpose
             position_ids = position_ids.squeeze(0).transpose(0, 1)  # [3, seq_len]
-            return position_ids, 1
-
-        events = []
-        image_idx = 0
-        #start_pos = 0
-        current_pos = 0
-        #print(f"image_positions + [len(input_tokens)]={image_positions + [len(input_tokens)]}")
-        # Process segments between image tokens
-        #for image_pos in (image_positions + [len(input_tokens)]):
+            
+            return position_ids, 0
+        
         events = []
         image_idx = 0
         current_pos = 0
@@ -1449,7 +1374,7 @@ class IsaacForConditionalGeneration(
             if image_pos <= last_processed_pos:
                 continue  # Skip already processed positions
             
-            # Add text before this image
+            # Add any text before this image
             if image_pos > current_pos:
                 text_tokens = image_pos - current_pos
                 text_event = Event(
@@ -1487,60 +1412,39 @@ class IsaacForConditionalGeneration(
         
         stream = Stream(events)
         tensor_stream = TensorStream([stream])
-        #print(f"tensor_stream={tensor_stream}")
+
         # Use Isaac's native MRoPE calculation
         position_ids = compute_mrope_pos_tensor(tensor_stream, n_pos_dims=3)
-        
-        #B, L, _ = position_ids.shape
 
         # Max position per batch across the 3 planes and sequence dimension: (B,)
         m_per_batch = position_ids.amax(dim=(1, 2))
 
-        # Sequence lengths per batch: (B,)
-        #seq_lens = torch.full_like(m_per_batch, L)
+        mrope_position_delta = (m_per_batch + 1 - len(input_tokens)).item()
 
-        #rope_delta = (m_per_batch + 1 - seq_lens)#.unsqueeze(1)
-        rope_delta = m_per_batch + 1 - len(input_tokens)
-
-        #print(f"position_ids shape before transposing={position_ids.shape}")
-        #print(f"position_ids before transposing={position_ids.squeeze(0)}")
-        #print(f"position_ids before transposing={position_ids.squeeze(0)[15:, :]}")
         # vLLM expects shape [3, seq_len] but Isaac returns [batch, seq_len, 3]
         # Transpose to match vLLM's expected format
         position_ids = position_ids.squeeze(0).transpose(0, 1)
-        '''
-        if position_ids.dim() == 3 and position_ids.shape[0] == 1:
-            # Remove batch dimension and transpose: [1, seq_len, 3] -> [seq_len, 3] -> [3, seq_len] 
-            position_ids = position_ids.squeeze(0).transpose(0, 1)
-        elif position_ids.dim() == 2:
-            # Already [seq_len, 3], just transpose to [3, seq_len]
-            position_ids = position_ids.transpose(0, 1)
-        '''
-        #print(f"position_ids shape={position_ids.shape}")
-        #print(f"position_ids={position_ids}")
-        #print(f"rope_delta={rope_delta}")
-        return position_ids, rope_delta
 
-    def get_multimodal_embeddings(self, **kwargs: object):
-        """Get multimodal embeddings from vision inputs."""
+        return position_ids, mrope_position_delta
+
+    def get_multimodal_embeddings(
+        self, **kwargs: object
+    ) -> MultiModalEmbeddings | None:    
+
         pixel_values = kwargs.get("pixel_values")
         image_grid_thw = kwargs.get("image_grid_thw")
 
         if pixel_values is None:
             return []
 
-        # Debug: Check how many images we're processing
-        print(f"DEBUG: Processing {pixel_values.shape[0]} images in get_multimodal_embeddings")
-        print(f"DEBUG: image_grid_thw shape: {image_grid_thw.shape}")
-
         # Convert image_grid_thw from [batch, 1, [T, H, W]] to [batch, [H, W]]
         spatial_grids = image_grid_thw[:, 0, 1:3]  # Extract H, W from [T, H, W] for each image
         
-        # Process vision through our vision_embedding module
+        # Process packed sequence patches through vision_embedding module
         vision_embeddings = self.vision_embedding((pixel_values, spatial_grids))
 
         # Split concatenated embeddings for each image item (following Qwen2-VL pattern)
-        merge_size = getattr(self.vision_embedding[0], 'pixel_shuffle_scale_factor', 2)  # Isaac uses pixel shuffle
+        merge_size = self.config.vision_config.pixel_shuffle_scale_factor  # Isaac uses pixel shuffle
         sizes = spatial_grids.prod(-1) // (merge_size * merge_size)  # H * W / (merge_size^2)
         
         return vision_embeddings.split(sizes.tolist())
@@ -1553,61 +1457,34 @@ class IsaacForConditionalGeneration(
         is_multimodal: torch.Tensor | None = None,
         handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
-        """
-        Get input embeddings for Isaac model, handling both text and multimodal inputs.
-        
-        This method merges text embeddings with multimodal (vision) embeddings using
-        Isaac's vision token ("<|image_pad|>") as the placeholder.
-        """
+
         # Get text embeddings from the base language model
         inputs_embeds = super().get_input_embeddings(input_ids)
         
         # If we have multimodal embeddings, merge them with text embeddings
         if multimodal_embeddings is not None and len(multimodal_embeddings) != 0:
-            # Import the merge utility
-            from vllm.model_executor.models.utils import merge_multimodal_embeddings
             
-            # Use the image token ID we configured (151655 for <|image_pad|>)
-            # Isaac doesn't use video tokens, so only provide image token ID
-            vision_token_id = getattr(self.config, 'image_token_id', 151655)
-            
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids=input_ids,
+            inputs_embeds = _merge_multimodal_embeddings(
                 inputs_embeds=inputs_embeds,
                 multimodal_embeddings=multimodal_embeddings,
-                placeholder_token_id=vision_token_id
+                is_multimodal=is_multimodal,
             )
-        
-        return inputs_embeds
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        pixel_values: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[torch.Tensor] = None,
-        **kwargs
-    ):
-        """Forward pass with proper multimodal signature."""
-        # For now, just call the parent Qwen3ForCausalLM forward method
-        # In a full implementation, this would integrate vision embeddings
-        return super().forward(input_ids=input_ids, positions=positions, **kwargs)
+        return inputs_embeds
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         skip_prefixes = []
         if self.vision_embedding is None:
-            skip_prefixes.extend(["model.vision_embedding."])
-        print(f"skip_prefixes = {skip_prefixes}!!!!!!!!!")
+            skip_prefixes.extend(["vision_embedding."])
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-    '''
+
     def get_mm_mapping(self) -> MultiModelKeys:
         """
         Get the module prefix in multimodal models
         """
         return MultiModelKeys.from_string_field(
-            language_model="language_model.layers",
+            language_model="language_model",
             connector="vision_embedding.3",  # The final linear layer
-            tower_model="vision_embedding.0",  # The vision transformer
+            tower_model="vision_embedding",
         )
-    '''
